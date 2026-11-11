@@ -62,7 +62,7 @@ func Decode(buff []byte) (*Record, error) {
 	binary_len := buff[:4]
 	recordLength := binary.BigEndian.Uint32(binary_len)
 
-	if uint32(len(buff[4:])) < recordLength {
+	if uint32(len(buff[4:])) != recordLength {
 		return nil, CorruptedRecord
 	}
 

@@ -14,6 +14,11 @@ type Segment struct {
 	BaseOffset uint64
 }
 
+var (
+	ErrSegmentOffsetOutOfRange = errors.New("segment: offset out of range")
+	ErrSegmentOffsetOutOfOrder = errors.New("segment: offset out of order")
+)
+
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	if err == nil {
@@ -58,7 +63,7 @@ func (seg *Segment) NextOffset() uint64 {
 
 func (seg *Segment) Append(rec Record) (offset uint64, err error) {
 	if uint64(rec.Offset) != seg.NextOffset() {
-		return 0, errors.New("segment: offset out of range")
+		return 0, ErrSegmentOffsetOutOfOrder
 	}
 
 	encoded_record := Encode(rec)
@@ -101,7 +106,7 @@ func (seg *Segment) Remove() error {
 
 func (seg *Segment) Read(offset uint64) (Record, error) {
 	if offset < seg.BaseOffset || offset >= seg.NextOffset() {
-		return Record{}, errors.New("segment: offset out of range")
+		return Record{}, ErrSegmentOffsetOutOfRange
 	}
 
 	relOffset := offset - seg.BaseOffset

@@ -17,6 +17,7 @@ type Config struct {
 	MaxSegSize   int64
 	MaxAge       time.Duration
 	MaxTotalSize int64
+	Now          func() time.Time
 }
 
 type Log struct {
@@ -94,6 +95,9 @@ func Open(dir string, cf Config) (*Log, error) {
 
 	activeSegment := log.ActiveSegment()
 	if err := recovery(activeSegment); err != nil {
+		for _, seg := range log.Segments {
+			seg.Close()
+		}
 		return nil, err
 	}
 
@@ -107,30 +111,34 @@ func recovery(activeSegment *Segment) error {
 	var relOffset int
 	var positions []int64
 	for {
-		//check len in file matches the len stored by the length field inside file
 		record_bytes, err := activeSegment.Store.Read(int64(pos))
 		if err != nil {
-			break
+			// These mean "valid data ends here": the normal end of the file,
+			// a torn final record, or a corrupt length field.
+			if errors.Is(err, ErrStorePositionOutOfRange) ||
+				errors.Is(err, ErrStoreIncompleteRecord) ||
+				errors.Is(err, ErrStoreRecordTooLarge) {
+				break
+			}
+			// Anything else is a real disk error. Return it so Open fails
+			// without truncating records that may be perfectly good.
+			return fmt.Errorf("log: recover segment %d: %w", activeSegment.BaseOffset, err)
 		}
 		if len(record_bytes[4:]) != int(binary.BigEndian.Uint32(record_bytes[0:4])) {
 			break
 		}
 
-		//Decode
 		if _, err := Decode(record_bytes); err != nil {
 			break
 		}
 
-		//Check Offset Validity
 		file_offset := binary.BigEndian.Uint64(record_bytes[9:17])
 		expected_offset := activeSegment.BaseOffset + uint64(relOffset)
-
 		if file_offset != expected_offset {
 			break
 		}
 
 		positions = append(positions, int64(pos))
-
 		pos = pos + len(record_bytes)
 		relOffset += 1
 	}
@@ -142,7 +150,6 @@ func recovery(activeSegment *Segment) error {
 		return err
 	}
 	return activeSegment.rebuildIndex(positions)
-
 }
 
 func (log *Log) ActiveSegment() *Segment {
@@ -198,7 +205,7 @@ func (log *Log) Append(key, value []byte) (uint64, error) {
 
 	rec := Record{
 		Offset:    appendSegment.NextOffset(),
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: log.now().UnixMilli(),
 		Key:       key,
 		Value:     value,
 	}
@@ -245,6 +252,13 @@ func (log *Log) HighestOffset() (uint64, error) {
 	return next - 1, nil
 }
 
+func (log *Log) now() time.Time {
+	if log.Cf.Now != nil {
+		return log.Cf.Now()
+	}
+	return time.Now()
+}
+
 func (log *Log) Close() error {
 	log.Mu.Lock()
 	defer log.Mu.Unlock()
@@ -256,4 +270,80 @@ func (log *Log) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (log *Log) ApplyRetention() (int, error) {
+	log.Mu.Lock()
+	defer log.Mu.Unlock()
+
+	var errs []error
+	removed := 0
+
+	// Rule 1: age. Delete closed segments whose newest record is too old.
+	if log.Cf.MaxAge > 0 {
+		for i := 0; i < len(log.Segments)-1; i++ {
+			segment := log.Segments[i]
+
+			entries := segment.Index.Entries()
+			if entries == 0 {
+				break
+			}
+
+			lastRecordPos, err := segment.Index.Read(entries - 1)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("log: retention: segment %d: %w", segment.BaseOffset, err))
+				break
+			}
+			recordBytes, err := segment.Store.Read(int64(lastRecordPos))
+			if err != nil {
+				errs = append(errs, fmt.Errorf("log: retention: segment %d: %w", segment.BaseOffset, err))
+				break
+			}
+			record, err := Decode(recordBytes)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("log: retention: segment %d: %w", segment.BaseOffset, err))
+				break
+			}
+
+			if log.now().Sub(time.UnixMilli(record.Timestamp)) < log.Cf.MaxAge {
+				break
+			}
+
+			if err := segment.Remove(); err != nil {
+				errs = append(errs, fmt.Errorf("log: retention: remove segment %d: %w", segment.BaseOffset, err))
+				break
+			}
+			removed++
+		}
+	}
+
+	// Rule 2: size. While the remaining segments are over the limit, delete
+	// the oldest closed one. Starts where the age rule stopped.
+	if log.Cf.MaxTotalSize > 0 && len(errs) == 0 {
+		var total int64
+		for _, segment := range log.Segments[removed:] {
+			total += segment.Store.Size()
+		}
+
+		for total > log.Cf.MaxTotalSize && removed < len(log.Segments)-1 {
+			segment := log.Segments[removed]
+			size := segment.Store.Size()
+
+			if err := segment.Remove(); err != nil {
+				errs = append(errs, fmt.Errorf("log: retention: remove segment %d: %w", segment.BaseOffset, err))
+				break
+			}
+			total -= size
+			removed++
+		}
+	}
+
+	// Both rules only remove from the front, so the first `removed`
+	// segments are exactly the ones deleted.
+	if removed > 0 {
+		clear(log.Segments[:removed])
+		log.Segments = log.Segments[removed:]
+	}
+
+	return removed, errors.Join(errs...)
 }

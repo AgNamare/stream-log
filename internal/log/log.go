@@ -3,16 +3,20 @@ package log
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Config struct {
-	MaxSegSize int64
+	MaxSegSize   int64
+	MaxAge       time.Duration
+	MaxTotalSize int64
 }
 
 type Log struct {
@@ -22,7 +26,13 @@ type Log struct {
 	Mu         sync.RWMutex
 }
 
+var ErrOffsetOutOfRange = errors.New("log: offset out of range")
+var ErrLogEmpty = errors.New("log: no records yet")
+
 func Open(dir string, cf Config) (*Log, error) {
+	if cf.MaxSegSize <= 0 {
+		return nil, errors.New("log: Segment size not configured")
+	}
 	log := &Log{
 		FolderPath: dir,
 		Cf:         cf,
@@ -82,7 +92,7 @@ func Open(dir string, cf Config) (*Log, error) {
 
 	log.Segments = segments
 
-	activeSegment := activeSegmet(segments)
+	activeSegment := log.ActiveSegment()
 	if err := recovery(activeSegment); err != nil {
 		return nil, err
 	}
@@ -90,6 +100,8 @@ func Open(dir string, cf Config) (*Log, error) {
 	return log, nil
 }
 
+// Recover the from the active segment if there was record with an error or
+// Failed write attempt onto disk
 func recovery(activeSegment *Segment) error {
 	pos := 0
 	var relOffset int
@@ -133,9 +145,115 @@ func recovery(activeSegment *Segment) error {
 
 }
 
-func activeSegmet(segments []*Segment) *Segment {
-	if len(segments) > 0 {
-		return segments[len(segments)-1]
+func (log *Log) ActiveSegment() *Segment {
+	if len(log.Segments) > 0 {
+		return log.Segments[len(log.Segments)-1]
 	}
 	return nil
+}
+
+func findSegment(segments []*Segment, offset uint64) (*Segment, error) {
+	if len(segments) == 0 || offset < segments[0].BaseOffset {
+		return nil, ErrOffsetOutOfRange
+	}
+
+	//Optimize search using binary search
+	lo, hi := 0, len(segments)-1
+	best := 0
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if segments[mid].BaseOffset <= offset {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return segments[best], nil
+}
+
+func (log *Log) Append(key, value []byte) (uint64, error) {
+	log.Mu.Lock()
+	defer log.Mu.Unlock()
+	activeSegment := log.ActiveSegment()
+
+	var appendSegment *Segment
+	//check if the active segment is full and add it if not
+	if activeSegment.IsFull() {
+		//sync prev segment b4 creating another one
+		err := activeSegment.Sync()
+		if err != nil {
+			return 0, err
+		}
+		newBaseOffset := activeSegment.NextOffset()
+		newSegment, err := NewSegment(log.FolderPath, log.Cf.MaxSegSize, newBaseOffset)
+		if err != nil {
+			return 0, err
+		}
+		log.Segments = append(log.Segments, newSegment)
+		appendSegment = newSegment
+	} else {
+		appendSegment = activeSegment
+	}
+
+	rec := Record{
+		Offset:    appendSegment.NextOffset(),
+		Timestamp: time.Now().UnixMilli(),
+		Key:       key,
+		Value:     value,
+	}
+	offset, err := appendSegment.Append(rec)
+	if err != nil {
+		return 0, err
+	}
+
+	return offset, nil
+}
+
+func (log *Log) Read(offset uint64) (rec Record, err error) {
+	log.Mu.RLock()
+	defer log.Mu.RUnlock()
+
+	if offset >= log.ActiveSegment().NextOffset() {
+		return Record{}, ErrOffsetOutOfRange
+	}
+
+	segment, err := findSegment(log.Segments, offset)
+	if err != nil {
+		return Record{}, err
+	}
+	return segment.Read(offset)
+}
+
+func (log *Log) LowestOffset() uint64 {
+	log.Mu.RLock()
+	defer log.Mu.RUnlock()
+	if len(log.Segments) > 0 {
+		return log.Segments[0].BaseOffset
+	}
+	return 0
+}
+
+func (log *Log) HighestOffset() (uint64, error) {
+	log.Mu.RLock()
+	defer log.Mu.RUnlock()
+
+	next := log.ActiveSegment().NextOffset()
+	if next == log.Segments[0].BaseOffset {
+		return 0, ErrLogEmpty
+	}
+	return next - 1, nil
+}
+
+func (log *Log) Close() error {
+	log.Mu.Lock()
+	defer log.Mu.Unlock()
+
+	var errs []error
+	for _, segment := range log.Segments {
+		if err := segment.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("log: close segment %d: %w", segment.BaseOffset, err))
+		}
+	}
+	return errors.Join(errs...)
 }

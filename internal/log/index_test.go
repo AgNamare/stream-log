@@ -82,7 +82,7 @@ func TestFileSizeMatchesEntries(t *testing.T) {
 	}
 }
 
-func TestReadOutOfRange(t *testing.T) {
+func TestIndexReadOutOfRange(t *testing.T) {
 	idx, _ := newTestIndex(t)
 
 	if _, err := idx.Read(0); !errors.Is(err, InvalidEntryError) {

@@ -69,7 +69,7 @@ func (seg *Segment) Append(rec Record) (offset uint64, err error) {
 		return 0, errors.New("segment: failed to append to log file")
 	}
 
-	relOffset := rec.Offset - int64(seg.BaseOffset)
+	relOffset := rec.Offset - seg.BaseOffset
 
 	err = seg.Index.Write(uint32(relOffset), uint32(pos))
 	if err != nil {

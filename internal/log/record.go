@@ -14,7 +14,7 @@ var (
 )
 
 type Record struct {
-	Offset    int64
+	Offset    uint64
 	Timestamp int64
 	Key       []byte
 	Value     []byte
@@ -92,7 +92,7 @@ func Decode(buff []byte) (*Record, error) {
 	value := buff[29+keyLen+4:]
 
 	record := &Record{
-		Offset:    int64(offset),
+		Offset:    offset,
 		Timestamp: int64(timestamp),
 		Key:       key,
 		Value:     value,
